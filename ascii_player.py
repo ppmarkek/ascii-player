@@ -379,6 +379,17 @@ def rune(a, b, text):
     return best
 
 
+def jag(rng, halvings, size, dots):
+    """Broken line that starts and ends at zero: each middle is thrown aside, ever less."""
+    off = np.zeros((2, 3), F32)
+    for _ in range(halvings):
+        mid = (off[:-1] + off[1:]) / 2 + rng.normal(0, size, (len(off) - 1, 3))
+        off = np.insert(off, np.arange(1, len(off)), mid, 0)
+        size *= 0.6
+    s = np.linspace(0, len(off) - 1, dots)  # straight runs between the sharp kinks
+    return np.stack([np.interp(s, np.arange(len(off)), row) for row in off.T], 1)
+
+
 class Hexcore(Scene):
     """The Hexcore: a polyhedron of rune pyramids with light in the gaps and lightning."""
 
@@ -386,8 +397,7 @@ class Hexcore(Scene):
     ZOOM = 0.31
     CRACK = 0.045  # half-width of the gap between tiles
     ROUND = 0.08  # corner radius of the triangular tiles
-    BOLTS = ((14, 0.015, 5.2, 0.85), (3, 0.005, 2.6, 0.3), (3, 0.005, 2.2, 0.3))
-    # lightning: points across, scatter, arc length, share of white
+    STRIKES = 160  # lightning strikes per loop
 
     def __init__(self, w, h, seed=7):
         super().__init__(w, h)
@@ -456,33 +466,39 @@ class Hexcore(Scene):
         self.beat = rng.integers(2, 7, (4, 26))  # whole number of swings per loop
         self.lag = rng.uniform(0, 2 * np.pi, (4, 26))
 
-        self.e1 = unit(rng.normal(size=(3, 1, 3)))  # orbits of the lightning arcs
-        self.e2 = unit(np.cross(self.e1, rng.normal(size=(3, 1, 3))))
-        self.e3 = np.cross(self.e1, self.e2)
-        self.phase = rng.uniform(0, 2 * np.pi, (3, 1))
+        self.born = rng.uniform(0, self.LOOP, self.STRIKES)  # when each strike flashes
+        self.life = rng.uniform(0.12, 0.5, self.STRIKES)  # and how long it lasts
 
         y, x = np.mgrid[:h, :w]  # backdrop: a narrow halo right around the core
         far = np.hypot(x - w / 2, y - h / 2) / (self.size * self.ZOOM)
         self.halo = (0.22 * GLOW * np.clip((1.62 - far) / 0.32, 0, 1)[..., None] ** 2)
 
-    def bolts(self, t, turn):
-        """Lightning: one thick arc and two thin ones, redrawn 12 times a second."""
-        rng = np.random.default_rng(int(t * 12))
-        s = np.linspace(0, 1, 900, dtype=F32)
-        arcs, paint = [], []
-        for k, (copies, blur, span, white) in enumerate(self.BOLTS):
-            lift, drift = (sum(np.interp(s, np.linspace(0, 1, n), rng.normal(0, size, n))
-                               for n, size in ((7, 0.07), (25, 0.04), (80, 0.015)))
-                           for _ in range(2))
-            if k and rng.random() < 0.3:  # the thin ones flash and go out
-                continue
-            ang = (self.phase[k] + (k + 2) * (-1) ** k * turn + span * s)[:, None]
-            arc = np.cos(ang) * self.e1[k] + np.sin(ang) * self.e2[k]
-            arc = arc * (1.43 + lift[:, None]) + self.e3[k] * drift[:, None]
-            arc = np.repeat(arc, copies, 0)
-            arcs.append(arc + rng.normal(0, blur, arc.shape))
-            paint.append(np.broadcast_to(RUNE + (255 - RUNE) * white, arc.shape))
-        return np.concatenate(arcs).astype(F32), np.concatenate(paint)
+    def bolts(self, t):
+        """Lightning: short strikes in random places, a broken channel with forks."""
+        arcs, paint = [np.zeros((0, 3), F32)], [np.zeros((0, 3), F32)]
+        age = (t - self.born) % self.LOOP / self.life
+        for k in np.flatnonzero(age < 1):
+            rng = np.random.default_rng(k)  # a strike keeps its channel while it lives
+            now = np.random.default_rng((k, round(t * 30)))  # and flickers every frame
+            a = unit(rng.normal(size=3))  # it jumps from one spot of the shell to another
+            b = unit(a + rng.normal(0, rng.uniform(0.5, 1.1), 3))
+            s = np.linspace(0, 1, 257, dtype=F32)[:, None]
+            rise = 1.12 + rng.uniform(0.25, 0.4) * (4 * s * (1 - s)) ** 0.6  # arcs over
+            path = unit(a + (b - a) * s) * (rise + rng.choice((0, 0, 0.3)) * s)
+            path = path + jag(rng, 5, 0.13, len(s))
+            lines = [(path, 14, 0.012, 0.9)]
+            for i in rng.integers(30, 200, rng.integers(1, 4)):  # thin forks fly outwards
+                tip = unit(path[i + 40] - path[i]) + 0.6 * unit(path[i])
+                tip = unit(tip + rng.normal(0, 0.5, 3)) * rng.uniform(0.25, 0.6)
+                fork = path[i] + tip * s[::4] + jag(rng, 4, 0.06, 65) * s[::4] ** 0.3
+                lines.append((fork, 4, 0.005, 0.35))
+            fade = min(1, 2.5 * (1 - age[k]))  # a white flash that crumbles into sparks
+            for line, copies, blur, white in lines:
+                line = np.repeat(line, copies, 0)[now.random(len(line) * copies) < fade]
+                arcs.append(line + now.normal(0, blur, line.shape))
+                ink = (RUNE + (255 - RUNE) * white * fade) * now.uniform(0.8, 1)
+                paint.append(np.broadcast_to(ink, line.shape))
+        return np.concatenate(arcs).astype(F32), np.concatenate(paint).astype(F32)
 
     def frame(self, t):
         t %= self.LOOP
@@ -505,7 +521,7 @@ class Hexcore(Scene):
         rgb = np.where(back, (HEART[0] + (HEART[1] - HEART[0]) * self.film) * 0.9, rgb)
         matte = ~(self.rim | back | self.sign)[:, 0]
 
-        arcs, flash = self.bolts(t, turn)
+        arcs, flash = self.bolts(t)
         cloud = [pts[self.keep], pts[~self.keep] * 0.9, arcs]
         paint = [rgb[self.keep], self.glare, flash]
         cam = np.concatenate(cloud) @ rot.T
